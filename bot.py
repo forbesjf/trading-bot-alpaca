@@ -8,15 +8,16 @@ silent failures, idempotency, Alpaca as source of truth for positions).
 
 import argparse
 import logging
+import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
-from alpaca_client import data_client
+from alpaca_client import data_client, trading_client
 from db import init_db
 from signals import compute_macd
 
@@ -25,6 +26,16 @@ logger = logging.getLogger("bot")
 # Number of most-recent daily bars to keep per ticker. MACD (26/9) needs ~34
 # bars to warm up; 60 gives comfortable headroom (STRATEGY.md §7 step 1).
 LOOKBACK_BARS = 60
+
+# Local SQLite audit log (STRATEGY.md §8). Gitignored.
+DB_PATH = "bot.db"
+
+# Position sizing & risk (STRATEGY.md §5/§6).
+POSITION_SIZE_DOLLARS = 3000.0  # fixed $ per trade regardless of equity (§5)
+MAX_POSITIONS = 10              # max concurrent positions (§5)
+STOP_LOSS_PCT = 0.08           # bracket stop-loss, -8% from entry (§6)
+TAKE_PROFIT_PCT = 0.20         # bracket take-profit, +20% from entry (§6)
+TIME_STOP_DAYS = 60            # calendar-day time stop (§6)
 
 # Trading universe (STRATEGY.md §2), grouped by the spec's categories. PLTR is
 # listed under both "AI & Semiconductors" and "Broader Tech & Software"; it
@@ -208,6 +219,203 @@ def _report_crossovers(
         )
 
 
+def get_alpaca_positions() -> dict[str, int]:
+    """Return current Alpaca positions as ``{symbol: qty}``.
+
+    Alpaca is the source of truth for positions (CLAUDE.md rule #5).
+    """
+    return {p.symbol: int(p.qty) for p in trading_client.get_all_positions()}
+
+
+def get_db_open_positions(conn: sqlite3.Connection) -> dict[str, dict]:
+    """Return open positions from the local DB (``exit_date IS NULL``).
+
+    Args:
+        conn: Open SQLite connection.
+
+    Returns:
+        Mapping of ticker -> ``{"qty": int, "entry_date": str}``.
+    """
+    rows = conn.execute(
+        "SELECT ticker, qty, entry_date FROM positions WHERE exit_date IS NULL"
+    ).fetchall()
+    return {r[0]: {"qty": int(r[1]), "entry_date": r[2]} for r in rows}
+
+
+def reconcile_positions(alpaca: dict[str, int], db: dict[str, dict]) -> None:
+    """Compare Alpaca positions against the DB audit log; warn on any mismatch.
+
+    Alpaca is authoritative; the DB is an audit log that should match it. Per
+    CLAUDE.md rule #5, mismatches are flagged loudly (WARNING) rather than
+    silently corrected.
+    """
+    only_alpaca = sorted(set(alpaca) - set(db))
+    only_db = sorted(set(db) - set(alpaca))
+    qty_mismatch = sorted(s for s in set(alpaca) & set(db) if alpaca[s] != db[s]["qty"])
+
+    logger.info(
+        "Step 4: %d Alpaca position(s), %d open DB position(s)", len(alpaca), len(db)
+    )
+    for s in only_alpaca:
+        logger.warning(
+            "  reconcile: %s held at Alpaca (qty %d) but not open in DB", s, alpaca[s]
+        )
+    for s in only_db:
+        logger.warning(
+            "  reconcile: %s open in DB (qty %d) but not held at Alpaca",
+            s,
+            db[s]["qty"],
+        )
+    for s in qty_mismatch:
+        logger.warning(
+            "  reconcile: %s qty mismatch — Alpaca %d vs DB %d",
+            s,
+            alpaca[s],
+            db[s]["qty"],
+        )
+    if not (only_alpaca or only_db or qty_mismatch):
+        logger.info("  reconcile: Alpaca and DB agree")
+
+
+def check_exits(
+    held: dict[str, int],
+    signals: dict[str, pd.DataFrame],
+    db_positions: dict[str, dict],
+    today: date,
+) -> list[dict]:
+    """Determine bot-submitted exits for held positions (STRATEGY.md §6).
+
+    Evaluates the two exit paths the bot is responsible for; the bracket
+    stop-loss/take-profit legs are handled Alpaca-side and are not considered
+    here. First trigger wins, with signal exit taking precedence over time stop:
+      - ``signal_exit``: bearish MACD crossover on the most recent bar
+      - ``time_stop``: position held >= TIME_STOP_DAYS calendar days
+
+    Args:
+        held: Alpaca positions ``{symbol: qty}`` (source of truth).
+        signals: Per-symbol compute_macd() output.
+        db_positions: Open DB positions, for entry dates.
+        today: Date used to measure the holding period.
+
+    Returns:
+        List of ``{"ticker", "qty", "reason"}`` dicts, sorted by ticker.
+    """
+    exits: list[dict] = []
+    for symbol in sorted(held):
+        reason: str | None = None
+
+        sig = signals.get(symbol)
+        if sig is not None and bool(sig["bearish_crossover"].iloc[-1]):
+            reason = "signal_exit"
+
+        if reason is None:
+            info = db_positions.get(symbol)
+            if info and info.get("entry_date"):
+                entry = datetime.fromisoformat(info["entry_date"]).date()
+                if (today - entry).days >= TIME_STOP_DAYS:
+                    reason = "time_stop"
+            elif symbol not in db_positions:
+                logger.warning(
+                    "  exit-check: %s held at Alpaca but missing from DB; "
+                    "cannot evaluate time stop",
+                    symbol,
+                )
+
+        if reason:
+            exits.append({"ticker": symbol, "qty": held[symbol], "reason": reason})
+    return exits
+
+
+def _report_exits(exits: list[dict], held: dict[str, int]) -> None:
+    """Log held-position count and any exit signals."""
+    logger.info(
+        "Step 5: %d held position(s); %d exit signal(s)", len(held), len(exits)
+    )
+    for e in exits:
+        logger.info(
+            "  EXIT %-5s qty %d | reason=%s", e["ticker"], e["qty"], e["reason"]
+        )
+
+
+def plan_entries(
+    fresh: list[str],
+    held: dict[str, int],
+    exits: list[dict],
+    bars: dict[str, pd.DataFrame],
+) -> tuple[list[dict], list[str]]:
+    """Plan entry orders from fresh crossovers under §3/§5 constraints.
+
+    Skips tickers already held (no pyramiding, §3), sizes each at a fixed
+    POSITION_SIZE_DOLLARS (qty = floor(size / last_close), skipping zero-qty),
+    and fills only the slots left under MAX_POSITIONS after accounting for
+    exits. ``fresh`` is already alphabetical, which is the §5 tiebreaker.
+
+    Returns:
+        ``(entries, skipped)`` — entries as order dicts; skipped as
+        human-readable reasons for logging.
+    """
+    slots = MAX_POSITIONS - (len(held) - len(exits))
+
+    entries: list[dict] = []
+    skipped: list[str] = []
+    for symbol in fresh:
+        if symbol in held:
+            skipped.append(f"{symbol} (already held — no pyramiding)")
+            continue
+        if len(entries) >= slots:
+            skipped.append(f"{symbol} (max {MAX_POSITIONS} positions reached)")
+            continue
+        close = float(bars[symbol]["close"].iloc[-1])
+        qty = int(POSITION_SIZE_DOLLARS // close)
+        if qty == 0:
+            skipped.append(
+                f"{symbol} (zero qty — ${close:.2f} > ${POSITION_SIZE_DOLLARS:.0f})"
+            )
+            continue
+        entries.append(
+            {
+                "ticker": symbol,
+                "qty": qty,
+                "close": close,
+                "stop": round(close * (1 - STOP_LOSS_PCT), 2),
+                "take_profit": round(close * (1 + TAKE_PROFIT_PCT), 2),
+            }
+        )
+    return entries, skipped
+
+
+def _report_intended_orders(
+    exits: list[dict], entries: list[dict], skipped: list[str], dry_run: bool
+) -> None:
+    """Log intended orders: exits first, then entries, then skips."""
+    mode = "DRY-RUN — nothing submitted" if dry_run else "LIVE"
+    logger.info(
+        "Step 6: intended orders (%s) — %d exit(s), %d entry(ies)",
+        mode,
+        len(exits),
+        len(entries),
+    )
+    for e in exits:
+        logger.info(
+            "  [EXIT]  market SELL %d %s @ next open | reason=%s",
+            e["qty"],
+            e["ticker"],
+            e["reason"],
+        )
+    for e in entries:
+        logger.info(
+            "  [ENTRY] bracket BUY %d %s @ next open (MOO) | est. close $%.2f"
+            " | stop $%.2f (-8%%) tp $%.2f (+20%%)",
+            e["qty"],
+            e["ticker"],
+            e["close"],
+            e["stop"],
+            e["take_profit"],
+        )
+    for s in skipped:
+        logger.info("  [SKIP]  %s", s)
+
+
 def setup_logging() -> None:
     """Configure logging to both stdout and bot.log (STRATEGY.md §10 / CLAUDE.md)."""
     logging.basicConfig(
@@ -251,12 +459,27 @@ def main(dry_run: bool = False) -> None:
     # 3. Identify fresh bullish crossovers on the most recently closed bar.
     fresh = find_fresh_bullish_crossovers(signals)
     _report_crossovers(fresh, signals, bars)
-    # 4. Pull current positions from Alpaca (source of truth; reconcile vs the DB).
+    # 4. Pull current positions from Alpaca (source of truth) and reconcile vs the DB.
+    conn = sqlite3.connect(DB_PATH)
+    init_db(conn)
+    alpaca_positions = get_alpaca_positions()
+    db_positions = get_db_open_positions(conn)
+    reconcile_positions(alpaca_positions, db_positions)
+
     # 5. Check exit conditions for held positions (signal exit, 60-day time stop).
-    # 6. Submit exit orders first, then entry orders up to the concurrency cap (§5).
-    #    In --dry-run, print intended orders instead of submitting them to Alpaca.
-    # 7. Write all activity (signals, orders, fills, positions, run) to SQLite via db.
-    # 8. Send the daily Slack summary.
+    today = datetime.now(timezone.utc).date()
+    exits = check_exits(alpaca_positions, signals, db_positions, today)
+    _report_exits(exits, alpaca_positions)
+
+    # 6. Plan orders (exits first, then entries up to the cap) and, in dry-run,
+    #    print them instead of submitting to Alpaca.
+    entries, skipped = plan_entries(fresh, alpaca_positions, exits, bars)
+    _report_intended_orders(exits, entries, skipped, dry_run)
+    if not dry_run:
+        raise NotImplementedError("live order submission not implemented yet (step 6)")
+
+    # 7. Write all activity (signals, orders, fills, positions, run) to SQLite via db.  (pending)
+    # 8. Send the daily Slack summary.  (pending)
 
 
 if __name__ == "__main__":
