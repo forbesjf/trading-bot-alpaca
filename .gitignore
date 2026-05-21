@@ -6,6 +6,7 @@
 
 # Logs
 bot.log
+cron.log
 
 # Python
 __pycache__/
