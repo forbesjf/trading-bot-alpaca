@@ -19,6 +19,13 @@ import requests
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    MarketOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
+)
 
 from alpaca_client import data_client, trading_client
 from db import init_db
@@ -251,6 +258,28 @@ def get_db_open_positions(conn: sqlite3.Connection) -> dict[str, dict]:
     return {r[0]: {"qty": int(r[1]), "entry_date": r[2]} for r in rows}
 
 
+def get_open_order_symbols() -> set[str]:
+    """Symbols with open (unfilled) orders at Alpaca — for idempotency (rule #4).
+
+    Note: a filled bracket entry leaves its stop-loss/take-profit legs OPEN, so
+    held symbols appear here too. That's fine for entry idempotency since held
+    symbols are already excluded from entry candidates.
+    """
+    open_orders = trading_client.get_orders(
+        filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
+    )
+    return {o.symbol for o in open_orders}
+
+
+def get_todays_orders(conn: sqlite3.Connection, day_iso: str) -> list[tuple[str, str]]:
+    """Return ``(ticker, side)`` for orders recorded in the DB today (rule #4)."""
+    rows = conn.execute(
+        "SELECT ticker, side FROM orders WHERE substr(timestamp, 1, 10) = ?",
+        (day_iso,),
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
 def reconcile_positions(
     conn: sqlite3.Connection,
     alpaca: dict[str, dict],
@@ -386,21 +415,24 @@ def _report_exits(exits: list[dict], held: dict[str, int]) -> None:
 
 def plan_entries(
     fresh: list[str],
-    held: dict[str, int],
+    held: dict[str, dict],
     exits: list[dict],
     bars: dict[str, pd.DataFrame],
+    duplicate_symbols: set[str],
 ) -> tuple[list[dict], list[dict]]:
     """Plan entry orders from fresh crossovers under §3/§5 constraints.
 
-    Skips tickers already held (no pyramiding, §3), sizes each at a fixed
-    POSITION_SIZE_DOLLARS (qty = floor(size / last_close), skipping zero-qty),
-    and fills only the slots left under MAX_POSITIONS after accounting for
-    exits. ``fresh`` is already alphabetical, which is the §5 tiebreaker.
+    Skips tickers already held (no pyramiding, §3), tickers that already have an
+    open Alpaca order or an order recorded today (idempotency, rule #4), sizes
+    each at a fixed POSITION_SIZE_DOLLARS (qty = floor(size / last_close),
+    skipping zero-qty), and fills only the slots left under MAX_POSITIONS after
+    accounting for exits. ``fresh`` is already alphabetical (the §5 tiebreaker).
 
     Returns:
         ``(entries, skipped)`` — entries as order dicts; skipped as dicts of
         ``{"ticker", "action"}`` where action is a signals-table action_taken
-        code (``skipped_held`` / ``skipped_max_positions`` / ``skipped_zero_qty``).
+        code (``skipped_held`` / ``skipped_duplicate`` /
+        ``skipped_max_positions`` / ``skipped_zero_qty``).
     """
     slots = MAX_POSITIONS - (len(held) - len(exits))
 
@@ -409,6 +441,9 @@ def plan_entries(
     for symbol in fresh:
         if symbol in held:
             skipped.append({"ticker": symbol, "action": "skipped_held"})
+            continue
+        if symbol in duplicate_symbols:
+            skipped.append({"ticker": symbol, "action": "skipped_duplicate"})
             continue
         if len(entries) >= slots:
             skipped.append({"ticker": symbol, "action": "skipped_max_positions"})
@@ -443,7 +478,7 @@ def _report_intended_orders(
     )
     for e in exits:
         logger.info(
-            "  [EXIT]  market SELL %d %s @ next open | reason=%s",
+            "  [EXIT]  close position %d %s (market, cancels bracket legs) | reason=%s",
             e["qty"],
             e["ticker"],
             e["reason"],
@@ -509,6 +544,55 @@ def build_order_rows(
     for e in entries:
         rows.append(
             (now, e["ticker"], "buy", e["qty"], "bracket", None, status, e["stop"], e["take_profit"])
+        )
+    return rows
+
+
+def submit_orders(exits: list[dict], entries: list[dict]) -> list[tuple]:
+    """Submit exits (close_position) then entries (bracket BUY) to Alpaca paper.
+
+    Exits go first so any freed buying power is available for entries
+    (STRATEGY.md §7 step 6). Each order's Alpaca id and status are captured for
+    the orders table. Returns the orders-table rows.
+
+    Exits use ``close_position``, which liquidates the position at market AND
+    cancels its open bracket legs (take-profit / stop-loss). A plain market SELL
+    would be rejected because those legs already reserve the shares.
+
+    Entries are bracket market orders with TIF DAY: submitted after the close,
+    Alpaca queues them to fill near the next open (approximating §4's MOO) while
+    remaining bracket-compatible. The stop/take-profit legs use the last close
+    as the reference price.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    rows: list[tuple] = []
+    for e in exits:
+        order = trading_client.close_position(e["ticker"])
+        logger.info(
+            "  [EXIT]  close_position %s (qty %d, %s) — id=%s status=%s",
+            e["ticker"], e["qty"], e["reason"], order.id, order.status,
+        )
+        rows.append(
+            (now, e["ticker"], "sell", e["qty"], "market", str(order.id), str(order.status), None, None)
+        )
+    for e in entries:
+        order = trading_client.submit_order(
+            MarketOrderRequest(
+                symbol=e["ticker"],
+                qty=e["qty"],
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=e["take_profit"]),
+                stop_loss=StopLossRequest(stop_price=e["stop"]),
+            )
+        )
+        logger.info(
+            "  [ENTRY] bracket BUY %d %s submitted — id=%s status=%s",
+            e["qty"], e["ticker"], order.id, order.status,
+        )
+        rows.append(
+            (now, e["ticker"], "buy", e["qty"], "bracket", str(order.id), str(order.status), e["stop"], e["take_profit"])
         )
     return rows
 
@@ -643,17 +727,37 @@ def main(dry_run: bool = False) -> None:
     exits = check_exits(alpaca_positions, signals, db_positions, today)
     _report_exits(exits, alpaca_positions)
 
-    # 6. Plan orders (exits first, then entries up to the cap) and, in dry-run,
-    #    print them instead of submitting to Alpaca.
-    entries, skipped = plan_entries(fresh, alpaca_positions, exits, bars)
+    # 6. Plan and submit orders (exits first, then entries up to the cap).
+    #    Idempotency (CLAUDE.md rule #4): skip entries whose symbol already has
+    #    an open Alpaca order or an order recorded in the DB today; skip exits
+    #    whose symbol was already sold today.
+    open_order_symbols = get_open_order_symbols()
+    todays_orders = get_todays_orders(conn, today.isoformat())
+    todays_buys = {t for t, side in todays_orders if side == "buy"}
+    todays_sells = {t for t, side in todays_orders if side == "sell"}
+
+    for e in exits:
+        if e["ticker"] in todays_sells:
+            logger.info("  [SKIP]  exit %s — already sold today (idempotency)", e["ticker"])
+    exits = [e for e in exits if e["ticker"] not in todays_sells]
+
+    entries, skipped = plan_entries(
+        fresh, alpaca_positions, exits, bars, open_order_symbols | todays_buys
+    )
     _report_intended_orders(exits, entries, skipped, dry_run)
-    if not dry_run:
-        raise NotImplementedError("live order submission not implemented yet (step 6)")
+
+    if dry_run:
+        order_rows = build_order_rows(exits, entries, "dry_run")
+    else:
+        logger.info(
+            "Step 6: submitting %d exit(s) then %d entry(ies) to Alpaca paper",
+            len(exits),
+            len(entries),
+        )
+        order_rows = submit_orders(exits, entries)
 
     # 7. Persist activity (signals, orders, run summary) to SQLite.
-    order_status = "dry_run" if dry_run else "pending"
     signal_rows = build_signal_rows(fresh, signals, bars, entries, skipped)
-    order_rows = build_order_rows(exits, entries, order_status)
     duration = (datetime.now(timezone.utc) - start_time).total_seconds()
     open_positions = len(alpaca_positions)
     run_row = (
