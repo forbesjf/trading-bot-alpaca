@@ -8,11 +8,13 @@ silent failures, idempotency, Alpaca as source of truth for positions).
 
 import argparse
 import logging
+import os
 import sqlite3
 import sys
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
+import requests
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -342,7 +344,7 @@ def plan_entries(
     held: dict[str, int],
     exits: list[dict],
     bars: dict[str, pd.DataFrame],
-) -> tuple[list[dict], list[str]]:
+) -> tuple[list[dict], list[dict]]:
     """Plan entry orders from fresh crossovers under §3/§5 constraints.
 
     Skips tickers already held (no pyramiding, §3), sizes each at a fixed
@@ -351,26 +353,25 @@ def plan_entries(
     exits. ``fresh`` is already alphabetical, which is the §5 tiebreaker.
 
     Returns:
-        ``(entries, skipped)`` — entries as order dicts; skipped as
-        human-readable reasons for logging.
+        ``(entries, skipped)`` — entries as order dicts; skipped as dicts of
+        ``{"ticker", "action"}`` where action is a signals-table action_taken
+        code (``skipped_held`` / ``skipped_max_positions`` / ``skipped_zero_qty``).
     """
     slots = MAX_POSITIONS - (len(held) - len(exits))
 
     entries: list[dict] = []
-    skipped: list[str] = []
+    skipped: list[dict] = []
     for symbol in fresh:
         if symbol in held:
-            skipped.append(f"{symbol} (already held — no pyramiding)")
+            skipped.append({"ticker": symbol, "action": "skipped_held"})
             continue
         if len(entries) >= slots:
-            skipped.append(f"{symbol} (max {MAX_POSITIONS} positions reached)")
+            skipped.append({"ticker": symbol, "action": "skipped_max_positions"})
             continue
         close = float(bars[symbol]["close"].iloc[-1])
         qty = int(POSITION_SIZE_DOLLARS // close)
         if qty == 0:
-            skipped.append(
-                f"{symbol} (zero qty — ${close:.2f} > ${POSITION_SIZE_DOLLARS:.0f})"
-            )
+            skipped.append({"ticker": symbol, "action": "skipped_zero_qty"})
             continue
         entries.append(
             {
@@ -385,7 +386,7 @@ def plan_entries(
 
 
 def _report_intended_orders(
-    exits: list[dict], entries: list[dict], skipped: list[str], dry_run: bool
+    exits: list[dict], entries: list[dict], skipped: list[dict], dry_run: bool
 ) -> None:
     """Log intended orders: exits first, then entries, then skips."""
     mode = "DRY-RUN — nothing submitted" if dry_run else "LIVE"
@@ -413,7 +414,120 @@ def _report_intended_orders(
             e["take_profit"],
         )
     for s in skipped:
-        logger.info("  [SKIP]  %s", s)
+        logger.info("  [SKIP]  %s — %s", s["ticker"], s["action"])
+
+
+def build_signal_rows(
+    fresh: list[str],
+    signals: dict[str, pd.DataFrame],
+    bars: dict[str, pd.DataFrame],
+    entries: list[dict],
+    skipped: list[dict],
+) -> list[tuple]:
+    """Build ``signals``-table rows for each fresh bullish crossover.
+
+    The action_taken column records whether the signal led to an order or was
+    skipped (and why), so the integrity criterion in STRATEGY.md §12 holds:
+    every signal has a corresponding action.
+    """
+    action_by_ticker = {e["ticker"]: "order_placed" for e in entries}
+    action_by_ticker.update({s["ticker"]: s["action"] for s in skipped})
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows: list[tuple] = []
+    for ticker in fresh:
+        last = signals[ticker].iloc[-1]
+        rows.append(
+            (
+                now,
+                ticker,
+                "bullish_crossover",
+                float(last["macd"]),
+                float(last["signal"]),
+                float(last["histogram"]),
+                float(bars[ticker]["close"].iloc[-1]),
+                action_by_ticker[ticker],
+            )
+        )
+    return rows
+
+
+def build_order_rows(
+    exits: list[dict], entries: list[dict], status: str
+) -> list[tuple]:
+    """Build ``orders``-table rows for intended exits (market) and entries (bracket)."""
+    now = datetime.now(timezone.utc).isoformat()
+    rows: list[tuple] = []
+    for e in exits:
+        # (timestamp, ticker, side, qty, order_type, alpaca_order_id, status, stop, limit)
+        rows.append((now, e["ticker"], "sell", e["qty"], "market", None, status, None, None))
+    for e in entries:
+        rows.append(
+            (now, e["ticker"], "buy", e["qty"], "bracket", None, status, e["stop"], e["take_profit"])
+        )
+    return rows
+
+
+def write_activity(
+    conn: sqlite3.Connection,
+    signal_rows: list[tuple],
+    order_rows: list[tuple],
+    run_row: tuple,
+) -> None:
+    """Insert signals, orders, and the run summary into SQLite (one transaction)."""
+    conn.executemany(
+        "INSERT INTO signals "
+        "(timestamp, ticker, signal_type, macd, signal_line, histogram, bar_close, action_taken) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        signal_rows,
+    )
+    conn.executemany(
+        "INSERT INTO orders "
+        "(timestamp, ticker, side, qty, order_type, alpaca_order_id, status, stop_price, limit_price) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        order_rows,
+    )
+    conn.execute(
+        "INSERT INTO runs "
+        "(timestamp, status, signals_count, orders_placed, open_positions, duration_seconds) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        run_row,
+    )
+    conn.commit()
+
+
+def _report_db_writes(conn: sqlite3.Connection) -> None:
+    """Read back and log what was persisted, so dry-run shows the actual rows."""
+    for table in ("signals", "orders", "runs"):
+        count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        logger.info("  wrote %d row(s) to %s", count, table)
+    for ticker, side, qty, otype, status, stop, limit in conn.execute(
+        "SELECT ticker, side, qty, order_type, status, stop_price, limit_price FROM orders"
+    ):
+        logger.info(
+            "    orders row: %-5s %-4s %d %-7s status=%s stop=%s tp=%s",
+            ticker, side, qty, otype, status, stop, limit,
+        )
+
+
+def send_slack_summary(message: str, dry_run: bool) -> None:
+    """Send the daily summary to Slack, or skip cleanly if unconfigured.
+
+    SLACK_WEBHOOK_URL is optional: if it's unset, log a WARNING and skip (no
+    silent failure — the absence is surfaced). In dry-run the message is shown
+    but not POSTed.
+    """
+    logger.info("Step 8: daily Slack summary: %s", message)
+    webhook = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook:
+        logger.warning("  SLACK_WEBHOOK_URL not set in .env; Slack notification skipped")
+        return
+    if dry_run:
+        logger.info("  (dry-run) not POSTing; the message above would be sent")
+        return
+    response = requests.post(webhook, json={"text": message}, timeout=10)
+    response.raise_for_status()
+    logger.info("  Slack summary sent (HTTP %d)", response.status_code)
 
 
 def setup_logging() -> None:
@@ -444,10 +558,11 @@ def parse_args() -> argparse.Namespace:
 def main(dry_run: bool = False) -> None:
     """Run one daily cycle of the bot.
 
-    The sequence below follows STRATEGY.md §7. Steps are documented as comments
-    only; nothing is implemented yet. ``dry_run`` will, once built, compute
-    signals and print intended orders without hitting Alpaca's order endpoint.
+    Follows the STRATEGY.md §7 sequence. Steps 1-8 run in dry-run; live order
+    submission (step 6) is not yet implemented and raises if dry_run is False.
     """
+    start_time = datetime.now(timezone.utc)
+
     # 1. Pull daily bars for every ticker in UNIVERSE (last LOOKBACK_BARS bars).
     bars = fetch_daily_bars(list(UNIVERSE))
     _report_bars(bars, list(UNIVERSE))
@@ -478,8 +593,42 @@ def main(dry_run: bool = False) -> None:
     if not dry_run:
         raise NotImplementedError("live order submission not implemented yet (step 6)")
 
-    # 7. Write all activity (signals, orders, fills, positions, run) to SQLite via db.  (pending)
-    # 8. Send the daily Slack summary.  (pending)
+    # 7. Persist activity (signals, orders, run summary) to SQLite.
+    order_status = "dry_run" if dry_run else "pending"
+    signal_rows = build_signal_rows(fresh, signals, bars, entries, skipped)
+    order_rows = build_order_rows(exits, entries, order_status)
+    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    open_positions = len(alpaca_positions)
+    run_row = (
+        datetime.now(timezone.utc).isoformat(),
+        "success",
+        len(fresh),
+        len(order_rows),
+        open_positions,
+        duration,
+    )
+    logger.info("Step 7: persisting activity to SQLite")
+    if dry_run:
+        # Don't pollute bot.db with orders that were never submitted; write to a
+        # throwaway in-memory DB and read it back to show the rows.
+        demo = sqlite3.connect(":memory:")
+        init_db(demo)
+        write_activity(demo, signal_rows, order_rows, run_row)
+        _report_db_writes(demo)
+        demo.close()
+        logger.info("  (dry-run: wrote to in-memory DB; %s untouched)", DB_PATH)
+    else:
+        write_activity(conn, signal_rows, order_rows, run_row)
+        _report_db_writes(conn)
+
+    # 8. Send the daily Slack summary (STRATEGY.md §9).
+    summary = (
+        f"📊 Bot run OK | {len(fresh)} signals | "
+        f"{len(order_rows)} orders | {open_positions} open"
+    )
+    send_slack_summary(summary, dry_run)
+
+    conn.close()
 
 
 if __name__ == "__main__":
