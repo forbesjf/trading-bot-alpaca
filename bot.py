@@ -11,6 +11,7 @@ import logging
 import os
 import sqlite3
 import sys
+import traceback
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
@@ -221,12 +222,18 @@ def _report_crossovers(
         )
 
 
-def get_alpaca_positions() -> dict[str, int]:
-    """Return current Alpaca positions as ``{symbol: qty}``.
+def get_alpaca_positions() -> dict[str, dict]:
+    """Return current Alpaca positions keyed by symbol.
 
     Alpaca is the source of truth for positions (CLAUDE.md rule #5).
+
+    Returns:
+        Mapping of symbol -> ``{"qty": int, "avg_entry_price": float}``.
     """
-    return {p.symbol: int(p.qty) for p in trading_client.get_all_positions()}
+    return {
+        p.symbol: {"qty": int(p.qty), "avg_entry_price": float(p.avg_entry_price)}
+        for p in trading_client.get_all_positions()
+    }
 
 
 def get_db_open_positions(conn: sqlite3.Connection) -> dict[str, dict]:
@@ -244,24 +251,34 @@ def get_db_open_positions(conn: sqlite3.Connection) -> dict[str, dict]:
     return {r[0]: {"qty": int(r[1]), "entry_date": r[2]} for r in rows}
 
 
-def reconcile_positions(alpaca: dict[str, int], db: dict[str, dict]) -> None:
-    """Compare Alpaca positions against the DB audit log; warn on any mismatch.
+def reconcile_positions(
+    conn: sqlite3.Connection,
+    alpaca: dict[str, dict],
+    db: dict[str, dict],
+    dry_run: bool,
+) -> None:
+    """Reconcile Alpaca positions (source of truth) against the DB audit log.
 
-    Alpaca is authoritative; the DB is an audit log that should match it. Per
-    CLAUDE.md rule #5, mismatches are flagged loudly (WARNING) rather than
-    silently corrected.
+    Per CLAUDE.md rule #5, Alpaca is authoritative and mismatches are flagged
+    loudly. A position held at Alpaca but absent from the DB is a filled order
+    that needs an audit row, so it is inserted into the ``positions`` table —
+    this is how filled entry orders become tracked. (In dry-run the insert is
+    only logged, not written.) Positions open in the DB but missing at Alpaca,
+    and quantity mismatches, are warnings for a human to investigate.
+
+    Note: Alpaca's position object has no entry timestamp, so ``entry_date`` is
+    recorded as the detection date (a ~1-day-late proxy, adequate for the
+    60-day time stop).
     """
     only_alpaca = sorted(set(alpaca) - set(db))
     only_db = sorted(set(db) - set(alpaca))
-    qty_mismatch = sorted(s for s in set(alpaca) & set(db) if alpaca[s] != db[s]["qty"])
+    qty_mismatch = sorted(
+        s for s in set(alpaca) & set(db) if alpaca[s]["qty"] != db[s]["qty"]
+    )
 
     logger.info(
         "Step 4: %d Alpaca position(s), %d open DB position(s)", len(alpaca), len(db)
     )
-    for s in only_alpaca:
-        logger.warning(
-            "  reconcile: %s held at Alpaca (qty %d) but not open in DB", s, alpaca[s]
-        )
     for s in only_db:
         logger.warning(
             "  reconcile: %s open in DB (qty %d) but not held at Alpaca",
@@ -272,9 +289,37 @@ def reconcile_positions(alpaca: dict[str, int], db: dict[str, dict]) -> None:
         logger.warning(
             "  reconcile: %s qty mismatch — Alpaca %d vs DB %d",
             s,
-            alpaca[s],
+            alpaca[s]["qty"],
             db[s]["qty"],
         )
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    for s in only_alpaca:
+        qty = alpaca[s]["qty"]
+        entry_price = alpaca[s]["avg_entry_price"]
+        if dry_run:
+            logger.info(
+                "  reconcile: %s held at Alpaca (qty %d @ $%.2f) not in DB; "
+                "would insert (dry-run)",
+                s,
+                qty,
+                entry_price,
+            )
+        else:
+            conn.execute(
+                "INSERT INTO positions (ticker, entry_date, entry_price, qty) "
+                "VALUES (?, ?, ?, ?)",
+                (s, today, entry_price, qty),
+            )
+            conn.commit()
+            logger.warning(
+                "  reconcile: inserted %s into DB positions (qty %d @ $%.2f) — "
+                "tracking filled order",
+                s,
+                qty,
+                entry_price,
+            )
+
     if not (only_alpaca or only_db or qty_mismatch):
         logger.info("  reconcile: Alpaca and DB agree")
 
@@ -294,7 +339,7 @@ def check_exits(
       - ``time_stop``: position held >= TIME_STOP_DAYS calendar days
 
     Args:
-        held: Alpaca positions ``{symbol: qty}`` (source of truth).
+        held: Alpaca positions ``{symbol: {qty, avg_entry_price}}`` (source of truth).
         signals: Per-symbol compute_macd() output.
         db_positions: Open DB positions, for entry dates.
         today: Date used to measure the holding period.
@@ -324,7 +369,7 @@ def check_exits(
                 )
 
         if reason:
-            exits.append({"ticker": symbol, "qty": held[symbol], "reason": reason})
+            exits.append({"ticker": symbol, "qty": held[symbol]["qty"], "reason": reason})
     return exits
 
 
@@ -510,24 +555,35 @@ def _report_db_writes(conn: sqlite3.Connection) -> None:
         )
 
 
-def send_slack_summary(message: str, dry_run: bool) -> None:
-    """Send the daily summary to Slack, or skip cleanly if unconfigured.
+def _post_to_slack(message: str, dry_run: bool) -> None:
+    """POST a message to the Slack webhook, or skip cleanly.
 
     SLACK_WEBHOOK_URL is optional: if it's unset, log a WARNING and skip (no
-    silent failure — the absence is surfaced). In dry-run the message is shown
-    but not POSTed.
+    silent failure — the absence is surfaced). In dry-run the message is not
+    POSTed.
     """
-    logger.info("Step 8: daily Slack summary: %s", message)
     webhook = os.getenv("SLACK_WEBHOOK_URL")
     if not webhook:
-        logger.warning("  SLACK_WEBHOOK_URL not set in .env; Slack notification skipped")
+        logger.warning("  SLACK_WEBHOOK_URL not set in .env; Slack message skipped")
         return
     if dry_run:
         logger.info("  (dry-run) not POSTing; the message above would be sent")
         return
     response = requests.post(webhook, json={"text": message}, timeout=10)
     response.raise_for_status()
-    logger.info("  Slack summary sent (HTTP %d)", response.status_code)
+    logger.info("  Slack message sent (HTTP %d)", response.status_code)
+
+
+def send_slack_summary(message: str, dry_run: bool) -> None:
+    """Log and send the daily summary to Slack (STRATEGY.md §9)."""
+    logger.info("Step 8: daily Slack summary: %s", message)
+    _post_to_slack(message, dry_run)
+
+
+def send_slack_error(message: str, dry_run: bool) -> None:
+    """Log and send a 🚨 error alert to Slack (STRATEGY.md §9)."""
+    logger.error(message)
+    _post_to_slack(message, dry_run)
 
 
 def setup_logging() -> None:
@@ -579,7 +635,8 @@ def main(dry_run: bool = False) -> None:
     init_db(conn)
     alpaca_positions = get_alpaca_positions()
     db_positions = get_db_open_positions(conn)
-    reconcile_positions(alpaca_positions, db_positions)
+    reconcile_positions(conn, alpaca_positions, db_positions, dry_run)
+    db_positions = get_db_open_positions(conn)  # refresh after reconciliation inserts
 
     # 5. Check exit conditions for held positions (signal exit, 60-day time stop).
     today = datetime.now(timezone.utc).date()
@@ -631,7 +688,51 @@ def main(dry_run: bool = False) -> None:
     conn.close()
 
 
+def _failing_function(exc: BaseException) -> str:
+    """Name of the deepest function in the traceback (for the §9 error format)."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    return frames[-1].name if frames else "unknown"
+
+
+def handle_fatal_error(exc: Exception, dry_run: bool) -> None:
+    """Record a fatal error to the errors table and Slack it (CLAUDE.md rule #3).
+
+    The caller re-raises afterwards so the process still exits non-zero — a
+    failed run must be loud, never swallowed.
+    """
+    func = _failing_function(exc)
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error("Fatal error in %s: %s", func, exc)
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        init_db(conn)
+        conn.execute(
+            "INSERT INTO errors (timestamp, function, exception, traceback) "
+            "VALUES (?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), func, str(exc), tb),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("Could not write to the errors table")
+
+    try:
+        send_slack_error(f"🚨 ERROR in {func}: {exc}", dry_run)
+    except Exception:
+        logger.exception("Could not send error Slack notification")
+
+
+def run(dry_run: bool) -> None:
+    """Run the daily cycle with top-level error handling (CLAUDE.md rule #3)."""
+    try:
+        main(dry_run=dry_run)
+    except Exception as exc:
+        handle_fatal_error(exc, dry_run)
+        raise
+
+
 if __name__ == "__main__":
     args = parse_args()
     setup_logging()
-    main(dry_run=args.dry_run)
+    run(dry_run=args.dry_run)
