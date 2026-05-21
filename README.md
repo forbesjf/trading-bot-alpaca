@@ -42,12 +42,10 @@ See [`STRATEGY.md`](STRATEGY.md) for the full strategy specification and [`CLAUD
 
 ## Running
 
-> `bot.py` is not implemented yet.
-
-Once built, the bot runs once daily after market close:
+The bot runs once daily after market close:
 
 ```bash
-python bot.py            # paper run
+python bot.py            # live paper run — submits orders to Alpaca
 python bot.py --dry-run  # compute signals and print intended orders without placing any
 ```
 
@@ -57,12 +55,45 @@ python bot.py --dry-run  # compute signals and print intended orders without pla
 pytest
 ```
 
-## Scheduling
+## Scheduling (launchd)
 
-Designed to run via cron at 4:15pm ET on trading days (STRATEGY.md §7):
+The bot is scheduled with a launchd agent (`com.jackforbes.tradingbot.plist`) so it
+runs at **4:15pm ET on weekdays even if the Mac was asleep** at the scheduled time —
+launchd runs a missed job on the next wake, unlike cron (STRATEGY.md §7).
 
+> The plist's `Hour` is the Mac's **local** time. It is set to `14:15` for Mountain
+> Time (MDT, UTC-6) = 4:15pm ET. Adjust `Hour` if your machine is in another timezone.
+
+Install:
+
+1. Copy the plist into your user LaunchAgents directory:
+
+   ```bash
+   cp com.jackforbes.tradingbot.plist ~/Library/LaunchAgents/
+   ```
+
+2. Load it:
+
+   ```bash
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jackforbes.tradingbot.plist
+   ```
+
+3. Verify it's registered:
+
+   ```bash
+   launchctl print gui/$(id -u)/com.jackforbes.tradingbot | grep -A3 -i calendar
+   ```
+
+To update after editing the plist, reload it:
+
+```bash
+cp com.jackforbes.tradingbot.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.jackforbes.tradingbot
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jackforbes.tradingbot.plist
 ```
-15 16 * * 1-5 cd /path/to/trading-bot && .venv/bin/python bot.py >> bot.log 2>&1
-```
 
-(Assumes the host clock is in ET; adjust if the host runs in UTC.)
+Optional — wake the Mac one minute early so the job runs on time even when asleep:
+
+```bash
+sudo pmset repeat wakeorpoweron MTWRF 14:14:00
+```

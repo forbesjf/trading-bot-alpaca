@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jackforbes.tradingbot</string>
+
+    <!-- Absolute venv python; bot.py is relative to WorkingDirectory below. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/JackForbes/trading-bot/.venv/bin/python</string>
+        <string>bot.py</string>
+    </array>
+
+    <!-- So .env, bot.db and bot.log resolve in the project directory. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/JackForbes/trading-bot</string>
+
+    <!-- 4:15pm ET = 14:15 MDT (UTC-6), this Mac's local time. Mon(1)-Fri(5). -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>14</integer>
+            <key>Minute</key><integer>15</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>14</integer>
+            <key>Minute</key><integer>15</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>14</integer>
+            <key>Minute</key><integer>15</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>14</integer>
+            <key>Minute</key><integer>15</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>14</integer>
+            <key>Minute</key><integer>15</integer>
+        </dict>
+    </array>
+
+    <!-- launchd runs a missed job on next wake. To instead wake the Mac one
+         minute before the job so it runs on time even when asleep:
+         sudo pmset repeat wakeorpoweron MTWRF 14:14:00 -->
+
+    <!-- Do NOT run on load/login; only at the scheduled times (and on wake if missed). -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Raw stdout/stderr capture (catches crashes before logging starts). -->
+    <key>StandardOutPath</key>
+    <string>/Users/JackForbes/trading-bot/cron.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/JackForbes/trading-bot/cron.log</string>
+</dict>
+</plist>
