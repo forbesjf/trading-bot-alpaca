@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-# trading-bot-alpaca
-Autonomous MACD momentum trading bot — signal generation, order execution, position reconciliation, and daily Slack reporting against Alpaca's paper trading API.
-=======
 # Trading Bot
 
 Algorithmic trading bot running a MACD momentum strategy in an **Alpaca paper trading account**.
@@ -70,4 +66,3 @@ Designed to run via cron at 4:15pm ET on trading days (STRATEGY.md §7):
 ```
 
 (Assumes the host clock is in ET; adjust if the host runs in UTC.)
->>>>>>> eff1ef8 (feat: scaffold repo, verified SQLite schema, 8 tests passing)
