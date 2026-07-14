@@ -8,13 +8,13 @@
     <!-- Absolute venv python; bot.py is relative to WorkingDirectory below. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/JackForbes/trading-bot/.venv/bin/python</string>
+        <string>/Users/JackForbes/trading-bot-alpaca/.venv/bin/python</string>
         <string>bot.py</string>
     </array>
 
     <!-- So .env, bot.db and bot.log resolve in the project directory. -->
     <key>WorkingDirectory</key>
-    <string>/Users/JackForbes/trading-bot</string>
+    <string>/Users/JackForbes/trading-bot-alpaca</string>
 
     <!-- 4:15pm ET = 14:15 MDT (UTC-6), this Mac's local time. Mon(1)-Fri(5). -->
     <key>StartCalendarInterval</key>
@@ -56,8 +56,8 @@
 
     <!-- Raw stdout/stderr capture (catches crashes before logging starts). -->
     <key>StandardOutPath</key>
-    <string>/Users/JackForbes/trading-bot/cron.log</string>
+    <string>/Users/JackForbes/trading-bot-alpaca/cron.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/JackForbes/trading-bot/cron.log</string>
+    <string>/Users/JackForbes/trading-bot-alpaca/cron.log</string>
 </dict>
 </plist>
