@@ -19,7 +19,14 @@ import requests
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import (
+    OrderClass,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    QueryOrderStatus,
+    TimeInForce,
+)
 from alpaca.trading.requests import (
     GetOrdersRequest,
     MarketOrderRequest,
@@ -250,12 +257,15 @@ def get_db_open_positions(conn: sqlite3.Connection) -> dict[str, dict]:
         conn: Open SQLite connection.
 
     Returns:
-        Mapping of ticker -> ``{"qty": int, "entry_date": str}``.
+        Mapping of ticker -> ``{"qty": int, "entry_date": str, "entry_price": float}``.
     """
     rows = conn.execute(
-        "SELECT ticker, qty, entry_date FROM positions WHERE exit_date IS NULL"
+        "SELECT ticker, qty, entry_date, entry_price FROM positions WHERE exit_date IS NULL"
     ).fetchall()
-    return {r[0]: {"qty": int(r[1]), "entry_date": r[2]} for r in rows}
+    return {
+        r[0]: {"qty": int(r[1]), "entry_date": r[2], "entry_price": float(r[3])}
+        for r in rows
+    }
 
 
 def get_open_order_symbols() -> set[str]:
@@ -278,6 +288,50 @@ def get_todays_orders(conn: sqlite3.Connection, day_iso: str) -> list[tuple[str,
         (day_iso,),
     ).fetchall()
     return [(r[0], r[1]) for r in rows]
+
+
+def _find_closing_fill(symbol: str) -> dict | None:
+    """Find the fill that closed the current position in ``symbol``, if any.
+
+    A position closes one of two ways (STRATEGY.md §6): a bracket leg fills
+    Alpaca-side (stop-loss/take-profit), or the bot submits a plain market
+    sell (signal_exit/time_stop). Both show up in closed-order history, so
+    this checks a bracket entry's legs for a FILLED stop/limit leg, and
+    top-level orders for a FILLED plain sell, and returns whichever is most
+    recent.
+
+    Returns:
+        ``{"exit_date": iso date, "exit_price": float, "leg_type": "stop" |
+        "limit" | None}`` (``leg_type`` is ``None`` for a bot-submitted plain
+        sell), or ``None`` if no closing fill is found yet.
+    """
+    orders = trading_client.get_orders(
+        filter=GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED, symbols=[symbol], nested=True, limit=100
+        )
+    )
+    candidates: list[tuple[datetime, float, str | None]] = []
+    for o in orders:
+        if (
+            o.order_class == OrderClass.SIMPLE
+            and o.side == OrderSide.SELL
+            and o.status == OrderStatus.FILLED
+            and o.filled_avg_price is not None
+        ):
+            candidates.append((o.filled_at, float(o.filled_avg_price), None))
+        for leg in o.legs or []:
+            if (
+                leg.side == OrderSide.SELL
+                and leg.status == OrderStatus.FILLED
+                and leg.filled_avg_price is not None
+            ):
+                leg_type = "limit" if leg.order_type == OrderType.LIMIT else "stop"
+                candidates.append((leg.filled_at, float(leg.filled_avg_price), leg_type))
+
+    if not candidates:
+        return None
+    filled_at, price, leg_type = max(candidates, key=lambda c: c[0])
+    return {"exit_date": filled_at.date().isoformat(), "exit_price": price, "leg_type": leg_type}
 
 
 def reconcile_positions(
@@ -309,11 +363,63 @@ def reconcile_positions(
         "Step 4: %d Alpaca position(s), %d open DB position(s)", len(alpaca), len(db)
     )
     for s in only_db:
-        logger.warning(
-            "  reconcile: %s open in DB (qty %d) but not held at Alpaca",
-            s,
-            db[s]["qty"],
-        )
+        fill = _find_closing_fill(s)
+        if fill is None:
+            logger.warning(
+                "  reconcile: %s open in DB (qty %d) but not held at Alpaca; "
+                "no closing fill found yet",
+                s,
+                db[s]["qty"],
+            )
+            continue
+
+        if fill["leg_type"] == "limit":
+            reason = "take_profit"
+        elif fill["leg_type"] == "stop":
+            reason = "stop_loss"
+        else:
+            # Bracket legs didn't fill, so this was a bot-submitted exit. The
+            # reason (signal_exit/time_stop) was stashed on the row at
+            # submission time (main() Step 6); fall back to signal_exit if
+            # that stash is somehow missing (e.g. a manual close outside the bot).
+            row = conn.execute(
+                "SELECT exit_reason FROM positions WHERE ticker = ? AND exit_date IS NULL",
+                (s,),
+            ).fetchone()
+            reason = row[0] if row and row[0] else "signal_exit"
+
+        entry_price = db[s]["entry_price"]
+        qty = db[s]["qty"]
+        exit_price = fill["exit_price"]
+        pnl_dollars = round((exit_price - entry_price) * qty, 2)
+        pnl_percent = round((exit_price / entry_price - 1) * 100, 4)
+
+        if dry_run:
+            logger.info(
+                "  reconcile: %s closed at Alpaca (exit $%.2f on %s, %s) not yet "
+                "in DB; would close (dry-run)",
+                s,
+                exit_price,
+                fill["exit_date"],
+                reason,
+            )
+        else:
+            conn.execute(
+                "UPDATE positions SET exit_date = ?, exit_price = ?, exit_reason = ?, "
+                "pnl_dollars = ?, pnl_percent = ? WHERE ticker = ? AND exit_date IS NULL",
+                (fill["exit_date"], exit_price, reason, pnl_dollars, pnl_percent, s),
+            )
+            conn.commit()
+            logger.warning(
+                "  reconcile: closed %s in DB — exit $%.2f on %s (%s), "
+                "pnl $%.2f (%.2f%%)",
+                s,
+                exit_price,
+                fill["exit_date"],
+                reason,
+                pnl_dollars,
+                pnl_percent,
+            )
     for s in qty_mismatch:
         logger.warning(
             "  reconcile: %s qty mismatch — Alpaca %d vs DB %d",
@@ -755,6 +861,15 @@ def main(dry_run: bool = False) -> None:
             len(entries),
         )
         order_rows = submit_orders(exits, entries)
+        # Stash the exit reason now, while it's known — the fill (and thus the
+        # exit_date/exit_price/pnl) isn't confirmed until a later run's
+        # reconcile_positions() sees the position drop off at Alpaca.
+        for e in exits:
+            conn.execute(
+                "UPDATE positions SET exit_reason = ? WHERE ticker = ? AND exit_date IS NULL",
+                (e["reason"], e["ticker"]),
+            )
+        conn.commit()
 
     # 7. Persist activity (signals, orders, run summary) to SQLite.
     signal_rows = build_signal_rows(fresh, signals, bars, entries, skipped)
